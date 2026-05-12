@@ -1,4 +1,4 @@
-// server.js v3 — แก้ Malformed JSON + เพิ่ม debug
+// server.js v4 — VidScan with Gemini Video Analysis
 const express = require('express');
 const cors    = require('cors');
 const https   = require('https');
@@ -6,195 +6,189 @@ const http    = require('http');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
-const KEY  = process.env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY  || '';
+const GEMINI_KEY     = process.env.GEMINI_API_KEY     || '';
+const RAILWAY_WORKER = (process.env.RAILWAY_WORKER_URL || '').replace(/\/$/, '');
 
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '50mb' }));
 
-app.get('/', (req, res) => res.json({ status:'ok', service:'VidScan API', version:'3.0', hasKey: !!KEY }));
+app.get('/', (req, res) => res.json({
+  status:'ok', service:'VidScan v4',
+  config:{ anthropic:!!ANTHROPIC_KEY, gemini:!!GEMINI_KEY, railway:!!RAILWAY_WORKER }
+}));
 
-// ── robust JSON extractor ─────────────────────────────────────
-function extractJSON(text) {
-  // strip markdown fences
-  let s = text.replace(/```json\s*/gi,'').replace(/```\s*/g,'').trim();
-  
-  const start = s.indexOf('{');
-  if (start === -1) throw new Error('No JSON object found in Claude response');
-  
-  // find matching closing brace
-  let depth=0, end=-1, inStr=false, esc=false;
-  for (let i=start; i<s.length; i++) {
-    const c = s[i];
-    if (esc) { esc=false; continue; }
-    if (c==='\\') { esc=true; continue; }
-    if (c==='"') { inStr=!inStr; continue; }
-    if (inStr) continue;
-    if (c==='{') depth++;
-    else if (c==='}') { depth--; if (depth===0) { end=i; break; } }
-  }
-  
-  if (end === -1) throw new Error('JSON object not closed properly');
-  
-  let chunk = s.slice(start, end+1);
-  
-  // attempt 1: direct parse
-  try { return JSON.parse(chunk); } catch(e1) {}
-  
-  // attempt 2: fix literal newlines inside string values
-  try {
-    const fixed = chunk.replace(/("(?:[^"\\]|\\.)*")|(\n)/g, (match, str, nl) => {
-      if (nl) return '\\n';  // literal newline outside strings → escape
-      return match;           // keep strings as-is
-    });
-    return JSON.parse(fixed);
-  } catch(e2) {}
-  
-  // attempt 3: aggressive fix - remove control chars, fix trailing commas
-  try {
-    let aggressive = chunk
-      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '') // control chars
-      .replace(/\n/g, '\\n')
-      .replace(/\r/g, '\\r')
-      .replace(/\t/g, '\\t')
-      .replace(/,(\s*[}\]])/g, '$1'); // trailing commas
-    return JSON.parse(aggressive);
-  } catch(e3) {
-    throw new Error(`Cannot parse JSON after 3 attempts. Last error: ${e3.message}. First 200 chars: ${chunk.slice(0,200)}`);
-  }
-}
-
-// ── fetch URL ─────────────────────────────────────────────────
-function fetchUrl(url, hops=0) {
+function httpPost(urlStr, body, extraHeaders={}) {
   return new Promise((resolve, reject) => {
-    if (hops>6) return reject(new Error('Too many redirects'));
-    const lib = url.startsWith('https') ? https : http;
-    const req = lib.request(url, {
-      method:'GET', timeout:10000,
-      headers:{
-        'User-Agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-        'Accept':'text/html,*/*;q=0.8',
-        'Accept-Language':'th-TH,th;q=0.9,en;q=0.8',
-        'Connection':'close',
-      }
+    const u = new URL(urlStr);
+    const lib = u.protocol==='https:' ? https : http;
+    const bs = JSON.stringify(body);
+    const req = lib.request({
+      hostname:u.hostname, port:u.port||(u.protocol==='https:'?443:80),
+      path:u.pathname+u.search, method:'POST', timeout:120000,
+      headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(bs),...extraHeaders}
     }, (res) => {
-      if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location) {
-        const next = res.headers.location.startsWith('http') ? res.headers.location
-          : new URL(res.headers.location, url).toString();
-        res.resume();
-        return fetchUrl(next, hops+1).then(resolve).catch(reject);
-      }
-      if (res.statusCode!==200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode}`)); }
-      let html='', size=0;
-      res.setEncoding('utf8');
-      res.on('data', c => { size+=c.length; if(size<300000) html+=c; else res.destroy(); });
-      res.on('end', () => resolve(html));
-      res.on('error', reject);
-    });
-    req.on('timeout', ()=>{ req.destroy(); reject(new Error('Timeout')); });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
-function parseMeta(html, url) {
-  const g = (...patterns) => { for(const p of patterns){const m=html.match(p);if(m)return m[1]||'';} return ''; };
-  const dec = s => s.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/\\n/g,' ').trim();
-  return {
-    title: dec(g(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']{2,200})["']/i, /<meta[^>]+content=["']([^"']{2,200})["'][^>]+property=["']og:title["']/i, /"title":"([^"]{2,200})"/, /<title[^>]*>([^<]{2,200})<\/title>/i)),
-    description: dec(g(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']{5,500})["']/i, /<meta[^>]+content=["']([^"']{5,500})["'][^>]+property=["']og:description["']/i, /"desc":"([^"]{5,500})"/, /"content":"([^"]{5,500})"/)),
-    image: g(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i, /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i),
-    url,
-  };
-}
-
-app.post('/fetch-url', async (req, res) => {
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ error:'url required' });
-  try {
-    const html = await fetchUrl(url);
-    const meta = parseMeta(html, url);
-    res.json({ success:true, meta });
-  } catch(err) {
-    res.json({ success:false, error:err.message, meta:{ title:'', description:'', image:'', url } });
-  }
-});
-
-// ── Claude API ────────────────────────────────────────────────
-function callClaude(system, user) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
-      system,
-      messages: [{ role:'user', content:user }]
-    });
-
-    const req = https.request({
-      hostname:'api.anthropic.com', path:'/v1/messages', method:'POST',
-      headers:{
-        'Content-Type':'application/json',
-        'x-api-key': KEY,
-        'anthropic-version':'2023-06-01',
-        'Content-Length': Buffer.byteLength(body)
-      }
-    }, (res) => {
-      let data='';
-      res.on('data', c => data+=c);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.error) return reject(new Error(`Anthropic: ${parsed.error.message}`));
-          const text = parsed.content?.find(b => b.type==='text')?.text || '';
-          console.log('Claude raw response (first 500):', text.slice(0,500));
-          const json = extractJSON(text);
-          resolve(json);
-        } catch(e) {
-          reject(e);
-        }
+      let d=''; res.on('data',c=>d+=c);
+      res.on('end',()=>{
+        try{resolve({status:res.statusCode,body:JSON.parse(d)});}
+        catch(e){resolve({status:res.statusCode,body:{raw:d.slice(0,500)}});}
       });
     });
-
-    req.on('error', reject);
-    req.write(body);
-    req.end();
+    req.on('timeout',()=>{req.destroy();reject(new Error('Timeout'));});
+    req.on('error',reject);
+    req.write(bs); req.end();
   });
 }
 
-// ── POST /analyze ─────────────────────────────────────────────
+function extractJSON(text) {
+  let s = text.replace(/```json\s*/gi,'').replace(/```\s*/g,'').trim();
+  const start = s.indexOf('{');
+  if(start===-1) throw new Error('No JSON');
+  let depth=0,end=-1,inStr=false,esc=false;
+  for(let i=start;i<s.length;i++){
+    const c=s[i];
+    if(esc){esc=false;continue} if(c==='\\'){esc=true;continue}
+    if(c==='"'){inStr=!inStr;continue} if(inStr)continue;
+    if(c==='{')depth++; else if(c==='}'){depth--;if(depth===0){end=i;break;}}
+  }
+  if(end===-1) throw new Error('Unclosed JSON');
+  const chunk=s.slice(start,end+1);
+  try{return JSON.parse(chunk);}catch(e1){}
+  try{return JSON.parse(chunk.replace(/\n/g,'\\n').replace(/\r/g,''));}catch(e2){}
+  try{return JSON.parse(chunk.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g,'').replace(/\n/g,'\\n').replace(/,(\s*[}\]])/g,'$1'));}
+  catch(e3){throw new Error(`JSON parse failed: ${e3.message}`);}
+}
+
+async function extractFromRailway(url) {
+  console.log('[Railway] extracting:', url);
+  // try video first
+  try {
+    const r = await httpPost(`${RAILWAY_WORKER}/extract`, {url, mode:'video'});
+    if(r.body.success && r.body.video_base64){
+      console.log('[Railway] got video:', r.body.video_size_mb+'MB');
+      return {type:'video', ...r.body};
+    }
+  } catch(e){ console.log('[Railway] video failed:', e.message); }
+  // try thumbnail
+  try {
+    const r = await httpPost(`${RAILWAY_WORKER}/extract`, {url, mode:'thumbnail'});
+    if(r.body.success && r.body.thumbnail_base64){
+      console.log('[Railway] got thumbnail');
+      return {type:'thumbnail', ...r.body};
+    }
+  } catch(e){ console.log('[Railway] thumbnail failed:', e.message); }
+  // metadata only
+  const r = await httpPost(`${RAILWAY_WORKER}/extract`, {url, mode:'metadata'});
+  if(r.body.success) return {type:'metadata', ...r.body};
+  throw new Error('Railway extraction failed: '+(r.body.error||'unknown'));
+}
+
+async function analyzeWithGemini(extracted) {
+  const prompt = `วิเคราะห์สินค้าในวิดีโอ/รูปนี้จาก Xiaohongshu แล้วตอบ raw JSON เท่านั้น:
+{"productName":"ชื่อสินค้าจริงที่เห็น","productCategory":"หมวดหมู่","productDescription":"รายละเอียดสินค้า","mainFeatures":["ฟีเจอร์1","ฟีเจอร์2","ฟีเจอร์3"],"targetUser":"กลุ่มเป้าหมาย","videoStyle":"สไตล์วิดีโอ","hookMoment":"จุดน่าสนใจ","estimatedPrice":"ราคาโดยประมาณ","productColors":["สี1"],"keyVisuals":"สิ่งที่เห็นชัด"}`;
+
+  let parts=[], model='gemini-1.5-flash';
+  if(extracted.type==='video' && extracted.video_base64){
+    parts=[{inlineData:{mimeType:extracted.video_mime||'video/mp4',data:extracted.video_base64}},{text:prompt}];
+    model='gemini-1.5-pro';
+  } else if(extracted.type==='thumbnail' && extracted.thumbnail_base64){
+    parts=[{inlineData:{mimeType:extracted.thumbnail_mime||'image/jpeg',data:extracted.thumbnail_base64}},{text:prompt}];
+  } else {
+    const m=extracted.data||{};
+    parts=[{text:`${prompt}\n\nTitle: ${m.title||''}\nDescription: ${m.description||''}`}];
+  }
+
+  const r = await httpPost(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`,
+    {contents:[{parts}], generationConfig:{temperature:0.1,maxOutputTokens:800}}
+  );
+  const text = r.body?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  if(!text) throw new Error('Gemini ไม่ตอบ: '+JSON.stringify(r.body).slice(0,200));
+  console.log('[Gemini] response:', text.slice(0,200));
+  return extractJSON(text);
+}
+
+async function claudeCopy(gemini, meta={}) {
+  const bs = JSON.stringify({
+    model:'claude-sonnet-4-20250514', max_tokens:2000,
+    system:'คุณคือ Copywriter Reels ไทย ตอบ raw JSON เท่านั้น ห้ามมี markdown',
+    messages:[{role:'user',content:`สินค้า: ${gemini.productName}
+ประเภท: ${gemini.productCategory}
+รายละเอียด: ${gemini.productDescription}
+ฟีเจอร์: ${(gemini.mainFeatures||[]).join(', ')}
+กลุ่มเป้าหมาย: ${gemini.targetUser}
+Title จาก XHS: ${meta.title||''}
+Description จาก XHS: ${meta.description||''}
+
+ตอบ raw JSON:
+{"topic":"สรุปคลิป 1-2 ประโยค","mainProduct":"${gemini.productName}","sellingPoints":["จุดขาย1","จุดขาย2","จุดขาย3"],"problemSolved":"ปัญหาที่แก้ได้","targetAudience":"${gemini.targetUser}","viralScore":8.5,"viralReasons":["เหตุผล1","เหตุผล2"],"clipHook":"วิธีเปิดคลิป","clipMiddle":"กลางคลิป","clipCTA":"ปิดคลิป","searchKeywords":["kw1","kw2","kw3"],"shopeeKeyword":"keyword Shopee","lazadaKeyword":"keyword Lazada","covers":{"attractive":["ข้อ1","ข้อ2","ข้อ3"],"selling":["ข้อ1","ข้อ2","ข้อ3"],"problem":["ข้อ1","ข้อ2","ข้อ3"],"viral":["ข้อ1","ข้อ2","ข้อ3"]},"captions":[{"id":1,"style":"ดราม่า","text":"แคปชั่น\\nบรรทัด2\\nemoji\\nCTA","cta":"comment"},{"id":2,"style":"น่ารัก","text":"...","cta":"share"},{"id":3,"style":"serious","text":"...","cta":"shop"},{"id":4,"style":"ตลก","text":"...","cta":"follow"},{"id":5,"style":"กระตุ้น","text":"...","cta":"comment"}]}`}]
+  });
+  return new Promise((resolve,reject)=>{
+    const req=https.request({
+      hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',timeout:60000,
+      headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01','Content-Length':Buffer.byteLength(bs)}
+    },(res)=>{
+      let d=''; res.on('data',c=>d+=c);
+      res.on('end',()=>{
+        try{const p=JSON.parse(d);if(p.error)return reject(new Error(p.error.message));resolve(extractJSON(p.content?.find(b=>b.type==='text')?.text||''));}
+        catch(e){reject(e);}
+      });
+    });
+    req.on('timeout',()=>{req.destroy();reject(new Error('Claude timeout'));});
+    req.on('error',reject); req.write(bs); req.end();
+  });
+}
+
+// Main analyze endpoint
 app.post('/analyze', async (req, res) => {
-  if (!KEY) return res.status(500).json({ error:'ANTHROPIC_API_KEY ยังไม่ได้ตั้งค่าใน Render Environment' });
-
-  const { title, description, url, fetchedMeta } = req.body;
-  const T = (fetchedMeta?.title || title || '').trim();
-  const D = (fetchedMeta?.description || description || '').trim();
-  const U = (url || '').trim();
-
-  if (!T && !D) return res.status(400).json({ error:'กรุณาใส่ชื่อวิดีโอหรือ caption อย่างน้อยหนึ่งอย่าง' });
-
-  const systemPrompt = `คุณคือผู้เชี่ยวชาญการตลาดออนไลน์และ Content Strategy สำหรับทีม Reels ขายสินค้าในไทย
-คุณต้องตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่นก่อนหรือหลัง JSON เด็ดขาด
-ห้ามใช้ markdown code blocks อย่างเด็ดขาด
-ตอบด้วย raw JSON object เริ่มต้นด้วย { และจบด้วย } เท่านั้น`;
-
-  const userPrompt = `วิดีโอจาก Xiaohongshu:
-URL: ${U||'(ไม่มี)'}
-Title: ${T||'(ไม่มี)'}
-Description: ${D||'(ไม่มี)'}
-
-ตอบด้วย JSON object นี้เท่านั้น (raw JSON ห้ามมี markdown):
-{"mainProduct":"ชื่อสินค้าหลัก","topic":"สรุป 1-2 ประโยค","sellingPoints":["จุดขาย1","จุดขาย2","จุดขาย3"],"problemSolved":"ปัญหาที่แก้ได้","targetAudience":"กลุ่มเป้าหมาย","viralScore":8.5,"viralReasons":["เหตุผล1","เหตุผล2"],"clipHook":"วิธีเปิดคลิป","clipMiddle":"กลางคลิป","clipCTA":"ปิดคลิป","searchKeywords":["kw1","kw2","kw3"],"shopeeKeyword":"keyword Shopee ภาษาไทย","lazadaKeyword":"keyword Lazada ภาษาไทย","covers":{"attractive":["ข้อ1","ข้อ2","ข้อ3"],"selling":["ข้อ1","ข้อ2","ข้อ3"],"problem":["ข้อ1","ข้อ2","ข้อ3"],"viral":["ข้อ1","ข้อ2","ข้อ3"]},"captions":[{"id":1,"style":"ดราม่า","text":"บรรทัด1\\nบรรทัด2\\nบรรทัด3 emoji\\nCTA","cta":"comment"},{"id":2,"style":"น่ารัก","text":"บรรทัด1\\nบรรทัด2\\nบรรทัด3 emoji\\nCTA","cta":"share"},{"id":3,"style":"serious","text":"บรรทัด1\\nบรรทัด2\\nบรรทัด3 emoji\\nCTA","cta":"shop"},{"id":4,"style":"ตลก","text":"บรรทัด1\\nบรรทัด2\\nบรรทัด3 emoji\\nCTA","cta":"follow"},{"id":5,"style":"กระตุ้น","text":"บรรทัด1\\nบรรทัด2\\nบรรทัด3 emoji\\nCTA","cta":"comment"}]}
-
-กฎ: ภาษาไทยทั้งหมด, ข้อความปกไม่เกิน 12 คำ, แคปชั่นใช้ \\n แทนการขึ้นบรรทัดใหม่`;
+  const {url, title, description} = req.body;
+  if(!ANTHROPIC_KEY) return res.status(500).json({error:'ANTHROPIC_API_KEY ยังไม่ได้ตั้งค่า'});
+  if(!GEMINI_KEY)    return res.status(500).json({error:'GEMINI_API_KEY ยังไม่ได้ตั้งค่า'});
 
   try {
-    const result = await callClaude(systemPrompt, userPrompt);
-    res.json({ success:true, data:result });
-  } catch(err) {
-    console.error('analyze error:', err.message);
-    res.status(500).json({ error: err.message });
+    let gemini, meta={};
+
+    if(url && RAILWAY_WORKER){
+      const extracted = await extractFromRailway(url);
+      if(extracted.data)   meta=extracted.data;
+      if(extracted.metadata) meta=extracted.metadata;
+      gemini = await analyzeWithGemini(extracted);
+    } else {
+      if(!title && !description) return res.status(400).json({error:'กรุณาใส่ URL หรือ title+description'});
+      meta = {title,description};
+      gemini = await analyzeWithGemini({type:'metadata', data:{title,description}});
+    }
+
+    const copy = await claudeCopy(gemini, meta);
+    res.json({success:true, data:{
+      ...copy,
+      mainProduct: gemini.productName || copy.mainProduct,
+      productDetail:{
+        name:gemini.productName, category:gemini.productCategory,
+        description:gemini.productDescription, features:gemini.mainFeatures||[],
+        colors:gemini.productColors||[], price:gemini.estimatedPrice||'',
+        keyVisuals:gemini.keyVisuals||'',
+      },
+      analyzedBy:'gemini-vision'
+    }});
+  } catch(err){
+    console.error('[analyze]', err.message);
+    res.status(500).json({error:err.message});
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`VidScan v3 | port:${PORT} | key:${KEY?'SET✓':'NOT SET✗'}`);
+// Fallback: text-only analyze (no Gemini)
+app.post('/analyze-text', async (req, res) => {
+  if(!ANTHROPIC_KEY) return res.status(500).json({error:'ANTHROPIC_API_KEY ยังไม่ได้ตั้งค่า'});
+  const {title,description} = req.body;
+  if(!title&&!description) return res.status(400).json({error:'ต้องมี title หรือ description'});
+  try {
+    const gemini = await analyzeWithGemini({type:'metadata',data:{title,description}});
+    const copy   = await claudeCopy(gemini, {title,description});
+    res.json({success:true, data:{...copy, mainProduct:gemini.productName||copy.mainProduct, analyzedBy:'text-only'}});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.listen(PORT, ()=>{
+  console.log(`VidScan v4 on :${PORT} | Anthropic:${!!ANTHROPIC_KEY} Gemini:${!!GEMINI_KEY} Railway:${!!RAILWAY_WORKER}`);
 });
